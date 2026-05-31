@@ -1,6 +1,5 @@
 """
-main.py - v2
-FastAPI backend with BERT emotion detection + Spotify song recommendations
+main.py - v3 (memory optimized for Render free tier 512MB)
 """
 
 from fastapi import FastAPI, HTTPException
@@ -12,13 +11,12 @@ from transformers import BertTokenizer, BertPreTrainedModel, BertModel, BertConf
 import torch.nn as nn
 import pandas as pd
 import numpy as np
-import os, sys, types, zipfile
+import os, sys, types, zipfile, gc
 
-# ── Emotion → Audio Feature Mapping ──────────────────────
 EMOTION_FEATURES = {
     'admiration':    {'valence':(0.6,1.0),'energy':(0.4,0.8),'genres':['classical','piano','acoustic']},
     'amusement':     {'valence':(0.7,1.0),'energy':(0.5,0.9),'genres':['pop','comedy','children']},
-    'anger':         {'valence':(0.0,0.3),'energy':(0.7,1.0),'genres':['metal','black-metal','alt-rock','rock']},
+    'anger':         {'valence':(0.0,0.3),'energy':(0.7,1.0),'genres':['metal','black-metal','alt-rock']},
     'annoyance':     {'valence':(0.0,0.3),'energy':(0.6,1.0),'genres':['punk','grunge','alt-rock']},
     'approval':      {'valence':(0.6,1.0),'energy':(0.5,0.8),'genres':['pop','indie','happy']},
     'caring':        {'valence':(0.5,0.9),'energy':(0.2,0.5),'genres':['acoustic','folk','singer-songwriter']},
@@ -53,22 +51,20 @@ EMOTION_COLS = [
     'joy','love','nervousness','optimism','pride','realization',
     'relief','remorse','sadness','surprise','neutral'
 ]
-ID2LABEL = {i: e for i, e in enumerate(EMOTION_COLS)}
-LABEL2ID = {e: i for i, e in enumerate(EMOTION_COLS)}
-
-MODEL_PATH  = os.environ.get("MODEL_PATH", "./best_model")
-DATASET_PATH = os.environ.get("DATASET_PATH", "./dataset.zip")
+ID2LABEL    = {i: e for i, e in enumerate(EMOTION_COLS)}
+LABEL2ID    = {e: i for i, e in enumerate(EMOTION_COLS)}
+MODEL_PATH  = os.environ.get("MODEL_PATH",  "./best_model")
+DATASET_PATH= os.environ.get("DATASET_PATH","./dataset.zip")
 MAX_LEN     = 128
 DROPOUT     = 0.3
 
-# ── Fix __file__ issue ────────────────────────────────────
+# ── Fix __file__ ──────────────────────────────────────────
 _mod = types.ModuleType("emotion_bert_module")
 _mod.__file__ = "/tmp/emotion_bert_module.py"
 sys.modules["emotion_bert_module"] = _mod
 with open("/tmp/emotion_bert_module.py", "w") as f:
     f.write("# placeholder\n")
 
-# ── Model ─────────────────────────────────────────────────
 class EmotionBERT(BertPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -86,14 +82,12 @@ class EmotionBERT(BertPreTrainedModel):
         out    = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         pooled = self.dropout(out.pooler_output)
         logits = self.classifier(pooled)
-        loss   = None
-        return {'loss': loss, 'logits': logits}
+        return {'logits': logits}
 
 EmotionBERT.__module__ = "emotion_bert_module"
 _mod.EmotionBERT = EmotionBERT
 
-# ── FastAPI App ───────────────────────────────────────────
-app = FastAPI(title="Emotion Music API v2", version="2.0.0")
+app = FastAPI(title="Emotion Music API", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 device    = torch.device("cpu")
@@ -105,42 +99,52 @@ music_df  = None
 async def load_all():
     global model, tokenizer, music_df
 
-    # Load BERT model
+    # Load BERT
     print("Loading BERT model...")
     tokenizer = BertTokenizer.from_pretrained(MODEL_PATH)
-    config    = BertConfig.from_pretrained(MODEL_PATH, num_labels=len(EMOTION_COLS),
+    config    = BertConfig.from_pretrained(MODEL_PATH,
+                    num_labels=len(EMOTION_COLS),
                     id2label=ID2LABEL, label2id=LABEL2ID)
-    model = EmotionBERT.from_pretrained(MODEL_PATH, config=config, ignore_mismatched_sizes=True)
+    model = EmotionBERT.from_pretrained(MODEL_PATH, config=config,
+                ignore_mismatched_sizes=True)
     model.eval().to(device)
-    print("✅ BERT model loaded!")
+    gc.collect()
+    print("✅ BERT loaded!")
 
-    # Load Spotify dataset
+    # Load Spotify — only needed columns to save memory
     print("Loading Spotify dataset...")
     try:
-        import zipfile
+        KEEP_COLS = ['track_name','artists','track_genre','popularity',
+                     'valence','energy','tempo','danceability']
         with zipfile.ZipFile(DATASET_PATH) as z:
-            with z.open("dataset.csv") as f:
-                music_df = pd.read_csv(f)
-        music_df = music_df.dropna(subset=['track_name','artists','valence','energy'])
+            with z.open('dataset.csv') as f:
+                music_df = pd.read_csv(f, usecols=KEEP_COLS)
+
+        music_df = music_df.dropna()
         music_df = music_df[music_df['popularity'] > 20]
         music_df = music_df.drop_duplicates(subset=['track_name','artists'])
-        print(f"✅ Spotify dataset loaded: {len(music_df):,} songs")
+        # Convert to float32 to save memory
+        for col in ['valence','energy','tempo','danceability']:
+            music_df[col] = music_df[col].astype('float32')
+        music_df['popularity'] = music_df['popularity'].astype('int16')
+        gc.collect()
+        print(f"✅ Spotify loaded: {len(music_df):,} songs")
     except Exception as e:
-        print(f"⚠️ Could not load Spotify dataset: {e}")
+        print(f"⚠️ Spotify load failed: {e}")
 
 def get_songs(emotion: str, top_n: int = 5):
     if music_df is None: return []
-    features = EMOTION_FEATURES.get(emotion, EMOTION_FEATURES['neutral'])
+    features    = EMOTION_FEATURES.get(emotion, EMOTION_FEATURES['neutral'])
     val_min, val_max = features['valence']
     eng_min, eng_max = features['energy']
-    genres = features['genres']
+    genres      = features['genres']
 
-    filtered = music_df[
+    filtered    = music_df[
         (music_df['valence'] >= val_min) & (music_df['valence'] <= val_max) &
         (music_df['energy']  >= eng_min) & (music_df['energy']  <= eng_max)
     ]
     genre_match = filtered[filtered['track_genre'].isin(genres)]
-    pool = genre_match if len(genre_match) >= top_n else filtered
+    pool        = genre_match if len(genre_match) >= top_n else filtered
     if len(pool) == 0: pool = music_df.sample(top_n)
 
     results = pool.sort_values('popularity', ascending=False).head(50).sample(min(top_n, len(pool)))
@@ -149,22 +153,25 @@ def get_songs(emotion: str, top_n: int = 5):
              'valence': round(float(r['valence']),2), 'energy': round(float(r['energy']),2),
              'tempo': round(float(r['tempo']),1)} for _, r in results.iterrows()]
 
-# ── Schemas ───────────────────────────────────────────────
 class TextInput(BaseModel):
     text: str
     top_k: int = 3
     num_songs: int = 5
 
-# ── Endpoints ─────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"message": "Emotion Music API v2", "version": "2.0.0"}
+    return {"message": "Emotion Music API", "version": "3.0.0"}
 
 @app.get("/health")
 def health():
     return {"status": "ok", "model_loaded": model is not None,
             "songs_loaded": music_df is not None,
             "total_songs": len(music_df) if music_df is not None else 0}
+
+@app.get("/debug")
+def debug():
+    return {"files": os.listdir("."), "dataset_exists": os.path.exists(DATASET_PATH),
+            "cwd": os.getcwd()}
 
 @app.post("/predict")
 def predict(input: TextInput):
@@ -183,13 +190,9 @@ def predict(input: TextInput):
 
     top_emotions = [{"emotion": ID2LABEL[i.item()], "confidence": round(p.item(), 4)}
                     for i, p in zip(top_i, top_p)]
-    top_emotion = top_emotions[0]["emotion"]
-    songs = get_songs(top_emotion, input.num_songs)
+    top_emotion  = top_emotions[0]["emotion"]
+    songs        = get_songs(top_emotion, input.num_songs)
 
-    return {
-        "text":        input.text,
-        "top_emotion": top_emotion,
-        "confidence":  top_emotions[0]["confidence"],
-        "top_k":       top_emotions,
-        "songs":       songs
-    }
+    return {"text": input.text, "top_emotion": top_emotion,
+            "confidence": top_emotions[0]["confidence"],
+            "top_k": top_emotions, "songs": songs}
