@@ -57,7 +57,7 @@ ID2LABEL = {i: e for i, e in enumerate(EMOTION_COLS)}
 LABEL2ID = {e: i for i, e in enumerate(EMOTION_COLS)}
 
 MODEL_PATH  = os.environ.get("MODEL_PATH", "./best_model")
-DATASET_PATH = os.environ.get("DATASET_PATH", "./dataset.csv")
+DATASET_PATH = os.environ.get("DATASET_PATH", "./dataset.zip")
 MAX_LEN     = 128
 DROPOUT     = 0.3
 
@@ -117,7 +117,10 @@ async def load_all():
     # Load Spotify dataset
     print("Loading Spotify dataset...")
     try:
-        music_df = pd.read_csv(DATASET_PATH)
+        import zipfile
+        with zipfile.ZipFile(DATASET_PATH) as z:
+            with z.open("dataset.csv") as f:
+                music_df = pd.read_csv(f)
         music_df = music_df.dropna(subset=['track_name','artists','valence','energy'])
         music_df = music_df[music_df['popularity'] > 20]
         music_df = music_df.drop_duplicates(subset=['track_name','artists'])
