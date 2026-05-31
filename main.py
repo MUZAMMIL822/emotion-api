@@ -1,48 +1,13 @@
 """
-main.py - v3 (memory optimized for Render free tier 512MB)
+main.py - v4 (ultra memory optimized — uses pre-built song lookup JSON)
 """
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import torch
-import torch.nn.functional as F
+import torch, torch.nn.functional as F
 from transformers import BertTokenizer, BertPreTrainedModel, BertModel, BertConfig
 import torch.nn as nn
-import pandas as pd
-import numpy as np
-import os, sys, types, zipfile, gc
-
-EMOTION_FEATURES = {
-    'admiration':    {'valence':(0.6,1.0),'energy':(0.4,0.8),'genres':['classical','piano','acoustic']},
-    'amusement':     {'valence':(0.7,1.0),'energy':(0.5,0.9),'genres':['pop','comedy','children']},
-    'anger':         {'valence':(0.0,0.3),'energy':(0.7,1.0),'genres':['metal','black-metal','alt-rock']},
-    'annoyance':     {'valence':(0.0,0.3),'energy':(0.6,1.0),'genres':['punk','grunge','alt-rock']},
-    'approval':      {'valence':(0.6,1.0),'energy':(0.5,0.8),'genres':['pop','indie','happy']},
-    'caring':        {'valence':(0.5,0.9),'energy':(0.2,0.5),'genres':['acoustic','folk','singer-songwriter']},
-    'confusion':     {'valence':(0.3,0.6),'energy':(0.2,0.5),'genres':['ambient','chill','idm']},
-    'curiosity':     {'valence':(0.4,0.7),'energy':(0.4,0.7),'genres':['jazz','bossa-nova','indie']},
-    'desire':        {'valence':(0.5,0.8),'energy':(0.4,0.7),'genres':['r-n-b','soul','romance']},
-    'disappointment':{'valence':(0.0,0.3),'energy':(0.1,0.4),'genres':['blues','sad','emo']},
-    'disapproval':   {'valence':(0.1,0.4),'energy':(0.4,0.7),'genres':['alternative','grunge','punk']},
-    'disgust':       {'valence':(0.0,0.3),'energy':(0.5,0.8),'genres':['metal','grunge','punk']},
-    'embarrassment': {'valence':(0.3,0.6),'energy':(0.2,0.5),'genres':['indie','acoustic','folk']},
-    'excitement':    {'valence':(0.7,1.0),'energy':(0.8,1.0),'genres':['edm','dance','party','electro']},
-    'fear':          {'valence':(0.0,0.3),'energy':(0.3,0.6),'genres':['ambient','dark-techno','emo']},
-    'gratitude':     {'valence':(0.7,1.0),'energy':(0.4,0.7),'genres':['gospel','soul','acoustic']},
-    'grief':         {'valence':(0.0,0.2),'energy':(0.0,0.3),'genres':['classical','sad','blues']},
-    'joy':           {'valence':(0.8,1.0),'energy':(0.7,1.0),'genres':['pop','happy','funk','dance']},
-    'love':          {'valence':(0.6,1.0),'energy':(0.3,0.6),'genres':['romance','r-n-b','acoustic']},
-    'nervousness':   {'valence':(0.2,0.5),'energy':(0.2,0.5),'genres':['ambient','chill','sleep']},
-    'optimism':      {'valence':(0.7,1.0),'energy':(0.5,0.8),'genres':['indie','pop','folk']},
-    'pride':         {'valence':(0.6,1.0),'energy':(0.7,1.0),'genres':['hip-hop','rap','work-out']},
-    'realization':   {'valence':(0.4,0.7),'energy':(0.3,0.6),'genres':['post-rock','indie','alternative']},
-    'relief':        {'valence':(0.5,0.8),'energy':(0.1,0.4),'genres':['acoustic','folk','chill']},
-    'remorse':       {'valence':(0.0,0.3),'energy':(0.1,0.4),'genres':['blues','sad','acoustic']},
-    'sadness':       {'valence':(0.0,0.3),'energy':(0.1,0.4),'genres':['sad','emo','blues','acoustic']},
-    'surprise':      {'valence':(0.5,0.9),'energy':(0.6,0.9),'genres':['electronic','indie','pop']},
-    'neutral':       {'valence':(0.3,0.7),'energy':(0.3,0.7),'genres':['chill','lo-fi','study']},
-}
+import os, sys, types, json, random, gc
 
 EMOTION_COLS = [
     'admiration','amusement','anger','annoyance','approval','caring',
@@ -51,12 +16,12 @@ EMOTION_COLS = [
     'joy','love','nervousness','optimism','pride','realization',
     'relief','remorse','sadness','surprise','neutral'
 ]
-ID2LABEL    = {i: e for i, e in enumerate(EMOTION_COLS)}
-LABEL2ID    = {e: i for i, e in enumerate(EMOTION_COLS)}
-MODEL_PATH  = os.environ.get("MODEL_PATH",  "./best_model")
-DATASET_PATH= os.environ.get("DATASET_PATH","./dataset.zip")
-MAX_LEN     = 128
-DROPOUT     = 0.3
+ID2LABEL   = {i: e for i, e in enumerate(EMOTION_COLS)}
+LABEL2ID   = {e: i for i, e in enumerate(EMOTION_COLS)}
+MODEL_PATH = os.environ.get("MODEL_PATH",  "./best_model")
+SONGS_PATH = os.environ.get("SONGS_PATH",  "./songs_lookup.json")
+MAX_LEN    = 128
+DROPOUT    = 0.3
 
 # ── Fix __file__ ──────────────────────────────────────────
 _mod = types.ModuleType("emotion_bert_module")
@@ -87,19 +52,18 @@ class EmotionBERT(BertPreTrainedModel):
 EmotionBERT.__module__ = "emotion_bert_module"
 _mod.EmotionBERT = EmotionBERT
 
-app = FastAPI(title="Emotion Music API", version="3.0.0")
+app = FastAPI(title="Emotion Music API", version="4.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-device    = torch.device("cpu")
-model     = None
-tokenizer = None
-music_df  = None
+device      = torch.device("cpu")
+model       = None
+tokenizer   = None
+songs_lookup = {}
 
 @app.on_event("startup")
 async def load_all():
-    global model, tokenizer, music_df
+    global model, tokenizer, songs_lookup
 
-    # Load BERT
     print("Loading BERT model...")
     tokenizer = BertTokenizer.from_pretrained(MODEL_PATH)
     config    = BertConfig.from_pretrained(MODEL_PATH,
@@ -111,47 +75,24 @@ async def load_all():
     gc.collect()
     print("✅ BERT loaded!")
 
-    # Load Spotify — only needed columns to save memory
-    print("Loading Spotify dataset...")
+    print("Loading songs lookup...")
     try:
-        KEEP_COLS = ['track_name','artists','track_genre','popularity',
-                     'valence','energy','tempo','danceability']
-        with zipfile.ZipFile(DATASET_PATH) as z:
-            with z.open('dataset.csv') as f:
-                music_df = pd.read_csv(f, usecols=KEEP_COLS)
-
-        music_df = music_df.dropna()
-        music_df = music_df[music_df['popularity'] > 20]
-        music_df = music_df.drop_duplicates(subset=['track_name','artists'])
-        # Convert to float32 to save memory
-        for col in ['valence','energy','tempo','danceability']:
-            music_df[col] = music_df[col].astype('float32')
-        music_df['popularity'] = music_df['popularity'].astype('int16')
-        gc.collect()
-        print(f"✅ Spotify loaded: {len(music_df):,} songs")
+        with open(SONGS_PATH, 'r') as f:
+            songs_lookup = json.load(f)
+        total = sum(len(v) for v in songs_lookup.values())
+        print(f"✅ Songs loaded: {total} songs for {len(songs_lookup)} emotions")
     except Exception as e:
-        print(f"⚠️ Spotify load failed: {e}")
+        print(f"⚠️ Songs load failed: {e}")
 
 def get_songs(emotion: str, top_n: int = 5):
-    if music_df is None: return []
-    features    = EMOTION_FEATURES.get(emotion, EMOTION_FEATURES['neutral'])
-    val_min, val_max = features['valence']
-    eng_min, eng_max = features['energy']
-    genres      = features['genres']
-
-    filtered    = music_df[
-        (music_df['valence'] >= val_min) & (music_df['valence'] <= val_max) &
-        (music_df['energy']  >= eng_min) & (music_df['energy']  <= eng_max)
-    ]
-    genre_match = filtered[filtered['track_genre'].isin(genres)]
-    pool        = genre_match if len(genre_match) >= top_n else filtered
-    if len(pool) == 0: pool = music_df.sample(top_n)
-
-    results = pool.sort_values('popularity', ascending=False).head(50).sample(min(top_n, len(pool)))
-    return [{'track_name': r['track_name'], 'artists': r['artists'],
-             'genre': r['track_genre'], 'popularity': int(r['popularity']),
-             'valence': round(float(r['valence']),2), 'energy': round(float(r['energy']),2),
-             'tempo': round(float(r['tempo']),1)} for _, r in results.iterrows()]
+    songs = songs_lookup.get(emotion, songs_lookup.get('neutral', []))
+    if not songs: return []
+    sample = random.sample(songs, min(top_n, len(songs)))
+    return [{'track_name': s['track_name'], 'artists': s['artists'],
+             'genre': s['track_genre'], 'popularity': int(s['popularity']),
+             'valence': round(float(s['valence']),2),
+             'energy': round(float(s['energy']),2),
+             'tempo': round(float(s['tempo']),1)} for s in sample]
 
 class TextInput(BaseModel):
     text: str
@@ -160,18 +101,18 @@ class TextInput(BaseModel):
 
 @app.get("/")
 def root():
-    return {"message": "Emotion Music API", "version": "3.0.0"}
+    return {"message": "Emotion Music API", "version": "4.0.0"}
 
 @app.get("/health")
 def health():
+    total = sum(len(v) for v in songs_lookup.values())
     return {"status": "ok", "model_loaded": model is not None,
-            "songs_loaded": music_df is not None,
-            "total_songs": len(music_df) if music_df is not None else 0}
+            "songs_loaded": len(songs_lookup) > 0, "total_songs": total}
 
 @app.get("/debug")
 def debug():
-    return {"files": os.listdir("."), "dataset_exists": os.path.exists(DATASET_PATH),
-            "cwd": os.getcwd()}
+    return {"files": os.listdir("."), "songs_path_exists": os.path.exists(SONGS_PATH),
+            "model_path_exists": os.path.exists(MODEL_PATH), "cwd": os.getcwd()}
 
 @app.post("/predict")
 def predict(input: TextInput):
