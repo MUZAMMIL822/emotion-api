@@ -2,5 +2,5 @@ fastapi==0.109.0
 uvicorn==0.27.0
 torch==2.9.0
 transformers==4.35.0
-pydantic==2.5.0
+pydantic==2.5.3
 python-multipart==0.0.6
