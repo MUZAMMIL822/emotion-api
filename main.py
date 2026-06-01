@@ -1,5 +1,5 @@
 """
-main.py - v4 (ultra memory optimized — uses pre-built song lookup JSON)
+main.py - v5 (multi-screen support: 10 recommended + more songs)
 """
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,7 +23,6 @@ SONGS_PATH = os.environ.get("SONGS_PATH",  "./songs_lookup.json")
 MAX_LEN    = 128
 DROPOUT    = 0.3
 
-# ── Fix __file__ ──────────────────────────────────────────
 _mod = types.ModuleType("emotion_bert_module")
 _mod.__file__ = "/tmp/emotion_bert_module.py"
 sys.modules["emotion_bert_module"] = _mod
@@ -52,42 +51,42 @@ class EmotionBERT(BertPreTrainedModel):
 EmotionBERT.__module__ = "emotion_bert_module"
 _mod.EmotionBERT = EmotionBERT
 
-app = FastAPI(title="Emotion Music API", version="4.0.0")
+app = FastAPI(title="Emotion Music API", version="5.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-device      = torch.device("cpu")
-model       = None
-tokenizer   = None
+device       = torch.device("cpu")
+model        = None
+tokenizer    = None
 songs_lookup = {}
 
 @app.on_event("startup")
 async def load_all():
     global model, tokenizer, songs_lookup
-
     print("Loading BERT model...")
     tokenizer = BertTokenizer.from_pretrained(MODEL_PATH)
     config    = BertConfig.from_pretrained(MODEL_PATH,
-                    num_labels=len(EMOTION_COLS),
-                    id2label=ID2LABEL, label2id=LABEL2ID)
-    model = EmotionBERT.from_pretrained(MODEL_PATH, config=config,
-                ignore_mismatched_sizes=True)
+                    num_labels=len(EMOTION_COLS), id2label=ID2LABEL, label2id=LABEL2ID)
+    model = EmotionBERT.from_pretrained(MODEL_PATH, config=config, ignore_mismatched_sizes=True)
     model.eval().to(device)
     gc.collect()
     print("✅ BERT loaded!")
-
-    print("Loading songs lookup...")
+    print("Loading songs...")
     try:
         with open(SONGS_PATH, 'r') as f:
             songs_lookup = json.load(f)
-        total = sum(len(v) for v in songs_lookup.values())
-        print(f"✅ Songs loaded: {total} songs for {len(songs_lookup)} emotions")
+        print(f"✅ Songs loaded for {len(songs_lookup)} emotions")
     except Exception as e:
         print(f"⚠️ Songs load failed: {e}")
 
-def get_songs(emotion: str, top_n: int = 5):
-    songs = songs_lookup.get(emotion, songs_lookup.get('neutral', []))
+def get_songs(emotion: str, num: int = 10, section: str = "recommended"):
+    data = songs_lookup.get(emotion, songs_lookup.get('neutral', {}))
+    # Support both old format (list) and new format (dict with recommended/more)
+    if isinstance(data, list):
+        songs = data
+    else:
+        songs = data.get(section, data.get('recommended', []))
     if not songs: return []
-    sample = random.sample(songs, min(top_n, len(songs)))
+    sample = random.sample(songs, min(num, len(songs)))
     return [{'track_name': s['track_name'], 'artists': s['artists'],
              'genre': s['track_genre'], 'popularity': int(s['popularity']),
              'valence': round(float(s['valence']),2),
@@ -97,29 +96,21 @@ def get_songs(emotion: str, top_n: int = 5):
 class TextInput(BaseModel):
     text: str
     top_k: int = 3
-    num_songs: int = 5
+    num_songs: int = 10
 
 @app.get("/")
-def root():
-    return {"message": "Emotion Music API", "version": "4.0.0"}
+def root(): return {"message": "Emotion Music API", "version": "5.0.0"}
 
 @app.get("/health")
 def health():
-    total = sum(len(v) for v in songs_lookup.values())
     return {"status": "ok", "model_loaded": model is not None,
-            "songs_loaded": len(songs_lookup) > 0, "total_songs": total}
-
-@app.get("/debug")
-def debug():
-    return {"files": os.listdir("."), "songs_path_exists": os.path.exists(SONGS_PATH),
-            "model_path_exists": os.path.exists(MODEL_PATH), "cwd": os.getcwd()}
+            "songs_loaded": len(songs_lookup) > 0,
+            "total_emotions": len(songs_lookup)}
 
 @app.post("/predict")
 def predict(input: TextInput):
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    if not input.text.strip():
-        raise HTTPException(status_code=400, detail="Text cannot be empty")
+    if model is None: raise HTTPException(status_code=503, detail="Model not loaded")
+    if not input.text.strip(): raise HTTPException(status_code=400, detail="Text empty")
 
     enc = tokenizer(input.text, padding='max_length', truncation=True,
                     max_length=MAX_LEN, return_tensors='pt')
@@ -132,8 +123,16 @@ def predict(input: TextInput):
     top_emotions = [{"emotion": ID2LABEL[i.item()], "confidence": round(p.item(), 4)}
                     for i, p in zip(top_i, top_p)]
     top_emotion  = top_emotions[0]["emotion"]
-    songs        = get_songs(top_emotion, input.num_songs)
 
-    return {"text": input.text, "top_emotion": top_emotion,
-            "confidence": top_emotions[0]["confidence"],
-            "top_k": top_emotions, "songs": songs}
+    return {
+        "text":        input.text,
+        "top_emotion": top_emotion,
+        "confidence":  top_emotions[0]["confidence"],
+        "top_k":       top_emotions,
+        "songs":       get_songs(top_emotion, input.num_songs, "recommended"),
+        "more_songs":  get_songs(top_emotion, 10, "more"),
+    }
+
+@app.get("/more/{emotion}")
+def more_songs(emotion: str, limit: int = 10):
+    return {"emotion": emotion, "songs": get_songs(emotion, limit, "more")}
