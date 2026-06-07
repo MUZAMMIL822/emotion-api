@@ -117,25 +117,89 @@ def build_summary(answers: List[str]) -> str:
     Build weighted summary from 5 answers.
     Later questions reveal emotion more directly so weighted more.
     Q1=1x, Q2=1x, Q3=2x, Q4=2x, Q5=3x
+    Also prepend question context so BERT understands the answer better.
     """
     weights = [1, 1, 2, 2, 3]
-    parts   = []
-    for ans, w in zip(answers, weights):
+    contexts = [
+        "The highlight of my day was",
+        "My day felt like",
+        "The last thing that made me feel was",
+        "Right now I want to",
+        "My day was",
+    ]
+    parts = []
+    for ans, w, ctx in zip(answers, weights, contexts):
         if ans.strip():
-            parts.extend([ans.strip()] * w)
+            # Prepend context to help BERT understand the answer
+            enriched = f"{ctx} {ans.strip()}"
+            parts.extend([enriched] * w)
     return '. '.join(parts)
 
-# ── Helper: get songs ─────────────────────────────────────
+# ── Emotion → ideal audio profile ────────────────────────
+EMOTION_AUDIO = {
+    'joy':            {'valence': 0.8, 'energy': 0.7},
+    'excitement':     {'valence': 0.7, 'energy': 0.9},
+    'love':           {'valence': 0.8, 'energy': 0.5},
+    'admiration':     {'valence': 0.7, 'energy': 0.5},
+    'amusement':      {'valence': 0.8, 'energy': 0.6},
+    'gratitude':      {'valence': 0.7, 'energy': 0.4},
+    'optimism':       {'valence': 0.75,'energy': 0.6},
+    'pride':          {'valence': 0.7, 'energy': 0.6},
+    'relief':         {'valence': 0.6, 'energy': 0.3},
+    'caring':         {'valence': 0.65,'energy': 0.4},
+    'sadness':        {'valence': 0.2, 'energy': 0.3},
+    'grief':          {'valence': 0.1, 'energy': 0.2},
+    'disappointment': {'valence': 0.2, 'energy': 0.3},
+    'remorse':        {'valence': 0.2, 'energy': 0.2},
+    'anger':          {'valence': 0.2, 'energy': 0.9},
+    'annoyance':      {'valence': 0.3, 'energy': 0.7},
+    'disgust':        {'valence': 0.2, 'energy': 0.6},
+    'fear':           {'valence': 0.2, 'energy': 0.6},
+    'nervousness':    {'valence': 0.3, 'energy': 0.6},
+    'confusion':      {'valence': 0.4, 'energy': 0.5},
+    'curiosity':      {'valence': 0.6, 'energy': 0.6},
+    'surprise':       {'valence': 0.6, 'energy': 0.7},
+    'desire':         {'valence': 0.6, 'energy': 0.5},
+    'embarrassment':  {'valence': 0.3, 'energy': 0.4},
+    'realization':    {'valence': 0.5, 'energy': 0.4},
+    'approval':       {'valence': 0.65,'energy': 0.5},
+    'disapproval':    {'valence': 0.3, 'energy': 0.5},
+    'neutral':        {'valence': 0.5, 'energy': 0.5},
+}
+
+# ── Helper: get songs ranked by audio feature match ──────
 def get_songs(emotion: str, num: int = 10, section: str = "recommended"):
-    data   = songs_lookup.get(emotion, songs_lookup.get('neutral', {}))
-    songs  = data.get(section, data.get('recommended', [])) if isinstance(data, dict) else data
+    data  = songs_lookup.get(emotion, songs_lookup.get('neutral', {}))
+    songs = data.get(section, data.get('recommended', [])) if isinstance(data, dict) else data
     if not songs: return []
-    sample = random.sample(songs, min(num, len(songs)))
+
+    # Get ideal audio profile for this emotion
+    profile = EMOTION_AUDIO.get(emotion, {'valence': 0.5, 'energy': 0.5})
+    tv = profile['valence']
+    te = profile['energy']
+
+    # Score each song by distance from ideal profile
+    # Also factor in popularity for tie-breaking
+    def score(s):
+        v = float(s.get('valence', 0.5))
+        e = float(s.get('energy',  0.5))
+        p = float(s.get('popularity', 50)) / 100.0
+        # Lower distance = better match
+        distance = ((v - tv) ** 2 + (e - te) ** 2) ** 0.5
+        return distance - (p * 0.05)  # popularity gives slight boost
+
+    # Sort by best match, add small randomness in top candidates
+    # to avoid always returning exact same songs
+    sorted_songs = sorted(songs, key=score)
+    # Take top 2x candidates and randomly sample from those
+    top_pool = sorted_songs[:min(num * 2, len(sorted_songs))]
+    selected = random.sample(top_pool, min(num, len(top_pool)))
+
     return [{'track_name': s['track_name'], 'artists': s['artists'],
              'genre': s['track_genre'], 'popularity': int(s['popularity']),
              'valence': round(float(s['valence']), 2),
              'energy':  round(float(s['energy']),  2),
-             'tempo':   round(float(s['tempo']),   1)} for s in sample]
+             'tempo':   round(float(s['tempo']),   1)} for s in selected]
 
 # ── Models ────────────────────────────────────────────────
 class TextInput(BaseModel):
